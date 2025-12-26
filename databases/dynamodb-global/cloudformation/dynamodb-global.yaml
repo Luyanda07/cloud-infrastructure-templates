@@ -1,1 +1,539 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DynamoDB with Global Tables for multi-region replication, point-in-time recovery, and monitoring'
 
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'myproject'
+    Description: Project name for resource naming
+    
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: Environment name
+    
+  TableName:
+    Type: String
+    Default: 'MyTable'
+    Description: Name of the DynamoDB table
+    
+  BillingMode:
+    Type: String
+    Default: 'PAY_PER_REQUEST'
+    AllowedValues: ['PAY_PER_REQUEST', 'PROVISIONED']
+    Description: Billing mode for the table
+    
+  ReadCapacityUnits:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: Read capacity units (only used if BillingMode is PROVISIONED)
+    
+  WriteCapacityUnits:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: Write capacity units (only used if BillingMode is PROVISIONED)
+    
+  PointInTimeRecoveryEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable point-in-time recovery
+    
+  DeletionProtectionEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable deletion protection
+    
+  StreamViewType:
+    Type: String
+    Default: 'NEW_AND_OLD_IMAGES'
+    AllowedValues: ['KEYS_ONLY', 'NEW_IMAGE', 'OLD_IMAGE', 'NEW_AND_OLD_IMAGES']
+    Description: Stream view type for DynamoDB Streams
+    
+  GlobalTableRegions:
+    Type: CommaDelimitedList
+    Default: 'us-east-1,us-west-2'
+    Description: List of regions for Global Tables (comma-separated)
+
+Conditions:
+  IsProvisionedBilling: !Equals [!Ref BillingMode, 'PROVISIONED']
+  EnablePointInTimeRecovery: !Equals [!Ref PointInTimeRecoveryEnabled, 'true']
+  EnableDeletionProtection: !Equals [!Ref DeletionProtectionEnabled, 'true']
+
+Resources:
+  # KMS Key for DynamoDB encryption
+  DynamoDBKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${ProjectName}-${Environment} DynamoDB encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow DynamoDB Service
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+              - kms:ReEncrypt*
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-dynamodb-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DynamoDBKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-dynamodb-key'
+      TargetKeyId: !Ref DynamoDBKMSKey
+
+  # DynamoDB Table
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-${TableName}'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: 'PK'
+          AttributeType: 'S'
+        - AttributeName: 'SK'
+          AttributeType: 'S'
+        - AttributeName: 'GSI1PK'
+          AttributeType: 'S'
+        - AttributeName: 'GSI1SK'
+          AttributeType: 'S'
+        - AttributeName: 'GSI2PK'
+          AttributeType: 'S'
+        - AttributeName: 'GSI2SK'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'PK'
+          KeyType: 'HASH'
+        - AttributeName: 'SK'
+          KeyType: 'RANGE'
+      GlobalSecondaryIndexes:
+        - IndexName: 'GSI1'
+          KeySchema:
+            - AttributeName: 'GSI1PK'
+              KeyType: 'HASH'
+            - AttributeName: 'GSI1SK'
+              KeyType: 'RANGE'
+          Projection:
+            ProjectionType: 'ALL'
+          ProvisionedThroughput: !If
+            - IsProvisionedBilling
+            - ReadCapacityUnits: !Ref ReadCapacityUnits
+              WriteCapacityUnits: !Ref WriteCapacityUnits
+            - !Ref 'AWS::NoValue'
+        - IndexName: 'GSI2'
+          KeySchema:
+            - AttributeName: 'GSI2PK'
+              KeyType: 'HASH'
+            - AttributeName: 'GSI2SK'
+              KeyType: 'RANGE'
+          Projection:
+            ProjectionType: 'ALL'
+          ProvisionedThroughput: !If
+            - IsProvisionedBilling
+            - ReadCapacityUnits: !Ref ReadCapacityUnits
+              WriteCapacityUnits: !Ref WriteCapacityUnits
+            - !Ref 'AWS::NoValue'
+      ProvisionedThroughput: !If
+        - IsProvisionedBilling
+        - ReadCapacityUnits: !Ref ReadCapacityUnits
+          WriteCapacityUnits: !Ref WriteCapacityUnits
+        - !Ref 'AWS::NoValue'
+      StreamSpecification:
+        StreamViewType: !Ref StreamViewType
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: !Ref DynamoDBKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePointInTimeRecovery, true, false]
+      DeletionProtectionEnabled: !If [EnableDeletionProtection, true, false]
+      ContributorInsightsSpecification:
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-${TableName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Global Table (requires manual setup in additional regions)
+  # Note: CloudFormation doesn't support cross-region Global Tables directly
+  # This would need to be set up manually or via custom resource
+
+  # IAM Role for DynamoDB access
+  DynamoDBAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-dynamodb-access-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:ConditionCheckItem
+                Resource:
+                  - !GetAtt DynamoDBTable.Arn
+                  - !Sub '${DynamoDBTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource: !GetAtt DynamoDBTable.StreamArn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt DynamoDBKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-dynamodb-access-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarms
+  ReadThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-${TableName}-ReadThrottle'
+      AlarmDescription: 'DynamoDB read throttle alarm'
+      MetricName: ReadThrottledEvents
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref DynamoDBTable
+      TreatMissingData: notBreaching
+
+  WriteThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-${TableName}-WriteThrottle'
+      AlarmDescription: 'DynamoDB write throttle alarm'
+      MetricName: WriteThrottledEvents
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref DynamoDBTable
+      TreatMissingData: notBreaching
+
+  ConsumedReadCapacityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProvisionedBilling
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-${TableName}-HighReadCapacity'
+      AlarmDescription: 'DynamoDB high read capacity utilization'
+      MetricName: ConsumedReadCapacityUnits
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ReadCapacityUnits
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref DynamoDBTable
+
+  ConsumedWriteCapacityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProvisionedBilling
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-${TableName}-HighWriteCapacity'
+      AlarmDescription: 'DynamoDB high write capacity utilization'
+      MetricName: ConsumedWriteCapacityUnits
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref WriteCapacityUnits
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref DynamoDBTable
+
+  # Lambda function for DynamoDB Stream processing (optional)
+  StreamProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-${TableName}-stream-processor'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt StreamProcessorRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info(f"Received event: {json.dumps(event)}")
+              
+              for record in event['Records']:
+                  event_name = record['eventName']
+                  dynamodb_record = record['dynamodb']
+                  
+                  logger.info(f"Processing {event_name} event")
+                  
+                  if event_name == 'INSERT':
+                      logger.info(f"New item: {dynamodb_record.get('NewImage', {})}")
+                  elif event_name == 'MODIFY':
+                      logger.info(f"Updated item: {dynamodb_record.get('NewImage', {})}")
+                  elif event_name == 'REMOVE':
+                      logger.info(f"Deleted item: {dynamodb_record.get('OldImage', {})}")
+              
+              return {'statusCode': 200, 'body': json.dumps('Successfully processed records')}
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoDBTable
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-${TableName}-stream-processor'
+        - Key: Environment
+          Value: !Ref Environment
+
+  StreamProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-stream-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBStreamAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource: !GetAtt DynamoDBTable.StreamArn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt DynamoDBKMSKey.Arn
+
+  # Event Source Mapping for DynamoDB Stream
+  StreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DynamoDBTable.StreamArn
+      FunctionName: !Ref StreamProcessorFunction
+      StartingPosition: TRIM_HORIZON
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+
+  # CloudWatch Dashboard
+  DynamoDBDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-${TableName}-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${DynamoDBTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Consumed Capacity Units",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ReadThrottledEvents", "TableName", "${DynamoDBTable}" ],
+                  [ ".", "WriteThrottledEvents", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Throttled Events",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "SuccessfulRequestLatency", "TableName", "${DynamoDBTable}", "Operation", "GetItem" ],
+                  [ "...", "PutItem" ],
+                  [ "...", "UpdateItem" ],
+                  [ "...", "DeleteItem" ],
+                  [ "...", "Query" ],
+                  [ "...", "Scan" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Request Latency (ms)",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ItemCount", "TableName", "${DynamoDBTable}" ],
+                  [ ".", "TableSizeBytes", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Table Size",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+Outputs:
+  TableName:
+    Description: 'DynamoDB table name'
+    Value: !Ref DynamoDBTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-TableName'
+
+  TableArn:
+    Description: 'DynamoDB table ARN'
+    Value: !GetAtt DynamoDBTable.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-TableArn'
+
+  StreamArn:
+    Description: 'DynamoDB stream ARN'
+    Value: !GetAtt DynamoDBTable.StreamArn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-StreamArn'
+
+  KMSKeyId:
+    Description: 'KMS key ID for DynamoDB encryption'
+    Value: !Ref DynamoDBKMSKey
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-KMSKeyId'
+
+  KMSKeyArn:
+    Description: 'KMS key ARN for DynamoDB encryption'
+    Value: !GetAtt DynamoDBKMSKey.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-KMSKeyArn'
+
+  AccessRoleArn:
+    Description: 'IAM role ARN for DynamoDB access'
+    Value: !GetAtt DynamoDBAccessRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-AccessRoleArn'
+
+  StreamProcessorFunctionArn:
+    Description: 'Lambda function ARN for stream processing'
+    Value: !GetAtt StreamProcessorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-StreamProcessorArn'
+
+  DashboardURL:
+    Description: 'CloudWatch Dashboard URL'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-${TableName}-Dashboard'
+
+  GlobalTableSetupInstructions:
+    Description: 'Instructions for setting up Global Tables'
+    Value: !Sub |
+      To set up Global Tables, run the following AWS CLI commands in each target region:
+      
+      1. Create table in additional regions (replace REGION):
+      aws dynamodb create-global-table --global-table-name ${DynamoDBTable} --replication-group RegionName=REGION --region ${AWS::Region}
+      
+      2. Or use the AWS Console:
+      - Go to DynamoDB Console
+      - Select your table: ${DynamoDBTable}
+      - Go to Global Tables tab
+      - Add regions: ${GlobalTableRegions}
